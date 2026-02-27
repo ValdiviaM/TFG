@@ -14,7 +14,7 @@ private:
     #define LORA_MISO  19
     #define LORA_MOSI  27
     #define LORA_CS    18
-    #define LORA_RST   14
+    #define LORA_RST   23
     #define LORA_DIO0  26  // <--- ESTE ES EL PIN DE INTERRUPCIÓN
 
     SPIClass spi = SPIClass(VSPI);
