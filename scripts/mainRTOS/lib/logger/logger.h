@@ -1,29 +1,33 @@
 #pragma once
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
+
+#include "DataTypes.h" // Important: Include this first
 #include <Arduino.h>
 #include <SD.h>
 #include <SPI.h>
 #include <array>
-#include <time.h>
-
-enum class Level { DEBUG, INFO, WARNING, ERROR, CRITICAL };
-enum class FileRole { LOG, MEASURE, COUNT };
 
 class Logger {
 private:
   std::array<String, (size_t)FileRole::COUNT> _filenames;
   int8_t _sck, _miso, _mosi, _ss;
   SPIClass _spiSD;
-  SemaphoreHandle_t _mutex;
+  SemaphoreHandle_t _spiMutex;
+  QueueHandle_t _logQueue;
 
   String formatTimestamp(time_t rawTime);
   String levelToString(Level level);
+  bool writeToSD(const String &message, Level level, FileRole role,
+                 time_t externalTime);
 
 public:
+  // Note: Using the explicit type for the array
   Logger(int8_t sck, int8_t miso, int8_t mosi, int8_t ss,
          const std::array<String, (size_t)FileRole::COUNT> &files);
-  bool begin();
-  bool log(const String &message, Level level = Level::INFO,
-           FileRole role = FileRole::LOG, time_t externalTime = 0);
+
+  bool begin(SemaphoreHandle_t sharedSpiMutex, size_t queueSize = 50);
+
+  // These now use the 'Level' enum correctly
+  bool log(const char *msg, Level level = Level::INFO);
+  bool logMeasure(const String &csvLine, time_t ts);
+  void processInternalLogs();
 };

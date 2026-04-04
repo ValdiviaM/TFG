@@ -21,7 +21,11 @@ PubSubClient mqtt(espClient);
 FlowSensor flow(25);
 PressureSensor pressure(MS5837::MS5837_02BA, 21, 22);
 ProximitySensor proximity(Serial2, 34, -1);
-LevelSensor tankLevel({32, 35, 39, 36});
+LevelSensor tankLevel({12, 35, 39, 36});
+
+const uint32_t REPORT_PERIOD_MS = 120000; // 15 segundos
+const uint32_t SAMPLING_PERIOD_MS =
+    20000; // 50ms para mantener vivo el Serial/Filtro
 
 QueueHandle_t measureQueue;
 QueueHandle_t errorQueue;
@@ -36,21 +40,14 @@ void UplinkTask(void *pv);
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n--- INICIANDO SISTEMA ---");
 
   // 1. Mutex de SPI
   spiMutex = xSemaphoreCreateMutex();
 
   // 2. Inicializar SD y Logger (Esto escribe las cabeceras si el archivo es
   // nuevo)
-  if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-    if (miLogger.begin()) {
-      Serial.println("SD: Inicializada y cabeceras verificadas.");
-    } else {
-      Serial.println("SD: ERROR al montar.");
-    }
-    lora.begin(1);
-    xSemaphoreGive(spiMutex);
+  if (miLogger.begin(spiMutex, 50)) {
+    miLogger.log("Sistema Iniciado", Level::INFO);
   }
 
   mqtt.setServer(mqtt_server, 1883);
@@ -62,7 +59,6 @@ void setup() {
   // 5. Crear Colas
   measureQueue = xQueueCreate(30, sizeof(TelemetryData));
   uplinkQueue = xQueueCreate(30, sizeof(TelemetryData));
-  errorQueue = xQueueCreate(30, sizeof(SystemLog));
 
   // 6. Lanzar Tareas
   xTaskCreatePinnedToCore(DataAcquisitionTask, "Sensors", 4096, NULL, 2, NULL,
@@ -76,16 +72,18 @@ void loop() { vTaskDelete(NULL); }
 // --- IMPLEMENTACIÓN DE TAREAS ---
 
 void DataAcquisitionTask(void *pv) {
-  flow.begin(); // Inicializar ISR aquí
+  flow.begin();
   TelemetryData data;
-  SystemLog sysLog;
-  uint32_t lastRead = 0;
-  int period = 15000;
+  uint32_t lastReportTime = 0;
+
   for (;;) {
+    // 1. HIGH FREQUENCY SAMPLING
+    // El sensor de proximidad necesita ser leído constantemente
     proximity.update();
 
-    if (millis() - lastRead > period) {
-      lastRead = millis();
+    // 2. LOW FREQUENCY REPORTING
+    if (millis() - lastReportTime >= REPORT_PERIOD_MS) {
+      lastReportTime = millis();
 
       data.flow_Lmin = flow.read();
       data.totalLiters = flow.getTotalLiters();
@@ -94,41 +92,18 @@ void DataAcquisitionTask(void *pv) {
       data.depth = pressure.depth();
       data.proximity_cm = proximity.read();
       data.waterLevel = tankLevel.read();
+      data.sentVia = TransMode::PENDING;
       time(&data.timestamp);
 
-      xQueueSend(measureQueue, &data, 0);
-      xQueueSend(uplinkQueue, &data, 0);
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-void StorageTask(void *pv) {
-  TelemetryData sData;
-  SystemLog lMsg;
-
-  for (;;) {
-    // 1. Procesar Errores
-    if (xQueueReceive(errorQueue, &lMsg, 0) == pdTRUE) {
-      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        miLogger.log(lMsg.msg, lMsg.level, FileRole::LOG, lMsg.timestamp);
-        xSemaphoreGive(spiMutex);
+      // Solo enviamos a la cola de Uplink.
+      // El Uplink se encargará de pasarle el relevo a Storage.
+      if (!xQueueSend(uplinkQueue, &data, 0)) {
+        miLogger.log("Uplink Queue Full!", Level::WARNING);
       }
     }
 
-    // 2. Procesar Mediciones
-    if (xQueueReceive(measureQueue, &sData, pdMS_TO_TICKS(100)) == pdTRUE) {
-      char buffer[128];
-      snprintf(buffer, sizeof(buffer), "%.2f,%.2f,%.2f,%.2f,%.2f,%d",
-               sData.flow_Lmin, sData.totalLiters, sData.pressure, sData.depth,
-               sData.proximity_cm, sData.waterLevel);
-
-      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
-        miLogger.log(buffer, Level::INFO, FileRole::MEASURE, sData.timestamp);
-        xSemaphoreGive(spiMutex);
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    // Delay corto para no saturar CPU pero procesar Serial
+    vTaskDelay(pdMS_TO_TICKS(SAMPLING_PERIOD_MS));
   }
 }
 
@@ -136,47 +111,36 @@ void UplinkTask(void *pv) {
   TelemetryData uData;
   uint32_t lastWiFiRetry = 0;
   uint32_t lastNTPSync = 0;
-  const uint32_t RETRY_INTERVAL =
-      300000; // 5 minutos entre intentos de reconexión
-  const uint32_t NTP_INTERVAL = 86400000; // 24 horas para re-sincronizar hora
-  auto reconnectMQTT = []() {
-    while (!mqtt.connected()) {
-      mqtt.connect("ESP32Client", access_token, NULL);
-      vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-  };
-  for (;;) {
-    // --- GESTIÓN DE CONEXIÓN ---
-    if (WiFi.status() != WL_CONNECTED) {
-      // Si no hay WiFi, intentamos reconectar cada 5 minutos
+  const uint32_t RETRY_INTERVAL = 300000;
+  const uint32_t NTP_INTERVAL = 86400000;
 
+  // Helper para mantenimiento
+  auto maintainConnectivity = [&]() {
+    if (WiFi.status() != WL_CONNECTED) {
       if (millis() - lastWiFiRetry > RETRY_INTERVAL || lastWiFiRetry == 0) {
         lastWiFiRetry = millis();
-        Serial.println("[WiFi] Intentando reconectar...");
-        WiFi.disconnect();
+        miLogger.log("[Uplink] Conectando WiFi...");
         WiFi.begin("Henry ", "Coque1428");
       }
-    } else {
-      // Si hay WiFi, verificamos si necesitamos sincronizar la hora
-      // (Si es la primera vez o pasaron 24h)
-      if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED ||
-          (millis() - lastNTPSync > NTP_INTERVAL)) {
-
-        Serial.println("[NTP] Sincronizando hora...");
-        configTime(-6 * 3600, 0, "pool.ntp.org");
-        lastNTPSync = millis();
-      }
+    } else if (lastNTPSync == 0 || (millis() - lastNTPSync > NTP_INTERVAL)) {
+      configTime(-6 * 3600, 0, "pool.ntp.org");
+      lastNTPSync = millis();
+      miLogger.log("[Uplink] Hora sincronizada.");
     }
+  };
 
-    // --- PROCESAMIENTO DE DATOS ---
-    if (xQueueReceive(uplinkQueue, &uData, pdMS_TO_TICKS(1000)) == pdTRUE) {
+  for (;;) {
+    // EL TRUCO: Esperar hasta 5 segundos por datos.
+    // Si no llegan, el xQueueReceive retorna pdFALSE y el loop continúa,
+    // permitiendo que maintainConnectivity() se ejecute.
+    if (xQueueReceive(uplinkQueue, &uData, pdMS_TO_TICKS(5000)) == pdTRUE) {
 
+      bool success = false;
       char timeStr[32];
       struct tm tm_info;
       localtime_r(&uData.timestamp, &tm_info);
       strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &tm_info);
 
-      // 1. Preparar Payload (Mismo formato que la SD para consistencia)
       char payload[160];
       snprintf(payload, sizeof(payload),
                "{\"F\":%.1f,\"T\":%.1f,\"P\":%.2f,\"D\":%.2f,\"DL\":%d,\"Px\":%"
@@ -185,25 +149,71 @@ void UplinkTask(void *pv) {
                uData.waterLevel, uData.proximity_cm, uData.totalLiters,
                timeStr);
 
-      // 2. Enviar por LoRa (Fallback Siempre Activo)
-      if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        lora.send_msg(payload, 100, true);
-        xSemaphoreGive(spiMutex);
-      }
-
-      // 3. Enviar por WiFi (Solo si está conectado)
+      // 1. Intentar MQTT
       if (WiFi.status() == WL_CONNECTED) {
         if (!mqtt.connected()) {
-          reconnectMQTT();
+          if (mqtt.connect("ESP32Client", access_token, NULL)) {
+            miLogger.log("Connected to MQTT");
+          } else {
+            miLogger.log("Failed to connect MQTT", Level::WARNING);
+          }
         }
-        mqtt.loop();
-        Serial.print("MQTT state: ");
-        Serial.println(mqtt.state());
-        Serial.println("Intentando publicar");
-        Serial.println(mqtt.publish("v1/devices/me/telemetry", payload));
-        Serial.println("Publicado");
+        if (mqtt.connected() &&
+            mqtt.publish("v1/devices/me/telemetry", payload)) {
+          uData.sentVia = TransMode::MQTT;
+          success = true;
+        } else {
+          miLogger.log("Failed to send via MQTT", Level::WARNING);
+        }
       }
+
+      // 2. Fallback a LoRa
+      if (!success) {
+        if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+          if (lora.send_msg(payload, 100, true)) {
+            uData.sentVia = TransMode::LORA;
+            success = true;
+          } else {
+            miLogger.log("Failed to send via LoRa", Level::WARNING);
+          }
+          xSemaphoreGive(spiMutex);
+        }
+      }
+
+      if (!success)
+        uData.sentVia = TransMode::FAIL;
+
+      // 3. Notificar a StorageTask que los datos están listos para guardarse
+      xQueueSend(measureQueue, &uData, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Esto se ejecuta SIEMPRE: ya sea porque llegaron datos o por el timeout de
+    // 5s
+    maintainConnectivity();
+    mqtt.loop(); // Mantener keep-alive de MQTT
+  }
+}
+
+void StorageTask(void *pv) {
+  TelemetryData sData;
+  SystemLog lMsg;
+
+  for (;;) {
+    // 1. Errores (Polling rápido)
+    miLogger.processInternalLogs();
+    // 2. Mediciones (Bloqueo total: esta tarea no consume CPU hasta que hay
+    // datos)
+    if (xQueueReceive(measureQueue, &sData, portMAX_DELAY) == pdTRUE) {
+      const char *modeStr = (sData.sentVia == TransMode::MQTT)   ? "MQTT"
+                            : (sData.sentVia == TransMode::LORA) ? "LORA"
+                                                                 : "FAIL";
+
+      char buffer[150];
+      snprintf(buffer, sizeof(buffer), "%.2f,%.2f,%.2f,%.2f,%.2f,%d,%s",
+               sData.flow_Lmin, sData.totalLiters, sData.pressure, sData.depth,
+               sData.proximity_cm, sData.waterLevel, modeStr);
+
+      miLogger.logMeasure(buffer, sData.timestamp);
+    }
   }
 }

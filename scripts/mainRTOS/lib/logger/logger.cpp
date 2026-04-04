@@ -5,42 +5,75 @@ Logger::Logger(int8_t sck, int8_t miso, int8_t mosi, int8_t ss,
     : _filenames(files), _sck(sck), _miso(miso), _mosi(mosi), _ss(ss),
       _spiSD(HSPI) {}
 
-bool Logger::begin() {
-  _spiSD.begin(_sck, _miso, _mosi, _ss);
-  if (!SD.begin(_ss, _spiSD))
+bool Logger::begin(SemaphoreHandle_t sharedSpiMutex, size_t queueSize) {
+  _spiMutex = sharedSpiMutex;
+  _logQueue = xQueueCreate(queueSize, sizeof(SystemLog));
+  if (_logQueue == NULL)
     return false;
 
-  _mutex = xSemaphoreCreateMutex();
-
-  for (const auto &path : _filenames) {
-    // Si el archivo no existe, lo creamos y escribimos cabecera
-    if (!SD.exists(path)) {
-      File f = SD.open(path, FILE_WRITE);
-      if (f) {
-        if (path.endsWith(".csv")) {
-          f.println(
-              "Date,Time,LogType,Flow,Total,Pressure,Depth,Proximity,Level");
-        } else {
-          f.println("--- Sistema Iniciado ---");
-        }
-        f.close();
-      }
-    }
+  _spiSD.begin(_sck, _miso, _mosi, _ss);
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(1000))) {
+    bool ok = SD.begin(_ss, _spiSD);
+    xSemaphoreGive(_spiMutex);
+    return ok;
   }
-  return true;
+  return false;
 }
 
-// 1. Cambiamos el espacio por una coma entre fecha y hora
+bool Logger::log(const char *msg, Level level) {
+  if (_logQueue == NULL)
+    return false;
+
+  SystemLog entry;
+  strncpy(entry.msg, msg, sizeof(entry.msg) - 1);
+  entry.msg[sizeof(entry.msg) - 1] = '\0';
+  entry.level = level;
+  time(&entry.timestamp);
+
+  return xQueueSend(_logQueue, &entry, 0) == pdTRUE;
+}
+
+void Logger::processInternalLogs() {
+  SystemLog entry; // Declared here
+  while (xQueueReceive(_logQueue, &entry, 0) == pdTRUE) {
+    writeToSD(entry.msg, entry.level, FileRole::LOG, entry.timestamp);
+  }
+}
+
+bool Logger::logMeasure(const String &csvLine, time_t ts) {
+  return writeToSD(csvLine, Level::INFO, FileRole::MEASURE, ts);
+}
+
+bool Logger::writeToSD(const String &message, Level level, FileRole role,
+                       time_t externalTime) {
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    return false;
+
+  String fileName = _filenames[(size_t)role];
+  String ts = formatTimestamp(externalTime);
+  String line = (role == FileRole::MEASURE)
+                    ? ts + "," + levelToString(level) + "," + message
+                    : ts + " [" + levelToString(level) + "]: " + message;
+
+  File file = SD.open(fileName, FILE_APPEND);
+  if (file) {
+    file.println(line);
+    file.close();
+    xSemaphoreGive(_spiMutex);
+    return true;
+  }
+  xSemaphoreGive(_spiMutex);
+  return false;
+}
+
 String Logger::formatTimestamp(time_t rawTime) {
   struct tm timeinfo;
   localtime_r(&rawTime, &timeinfo);
   char buffer[25];
-  // Cambiado: %Y-%m-%d,%H:%M:%S (Nota la coma)
   strftime(buffer, sizeof(buffer), "%Y-%m-%d,%H:%M:%S", &timeinfo);
   return String(buffer);
 }
 
-// 2. Quitamos los corchetes para que sea solo el texto
 String Logger::levelToString(Level level) {
   switch (level) {
   case Level::DEBUG:
@@ -56,33 +89,4 @@ String Logger::levelToString(Level level) {
   default:
     return "UNKNOWN";
   }
-}
-
-// 3. Quitamos el espacio y los dos puntos, usamos COMAS
-bool Logger::log(const String &message, Level level, FileRole role,
-                 time_t externalTime) {
-  if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(200)) != pdTRUE)
-    return false;
-
-  String fileName = _filenames[(size_t)role];
-  String ts = formatTimestamp(externalTime);
-
-  String line;
-  if (role == FileRole::MEASURE) {
-    // Para el CSV: Date,Time,LogType,Mensaje(datos...)
-    line = ts + "," + levelToString(level) + "," + message;
-  } else {
-    // Para el LOG de sistema seguimos usando un formato legible
-    line = ts + " [" + levelToString(level) + "]: " + message;
-  }
-
-  File file = SD.open(fileName, FILE_APPEND);
-  if (file) {
-    file.println(line);
-    file.close();
-    xSemaphoreGive(_mutex);
-    return true;
-  }
-  xSemaphoreGive(_mutex);
-  return false;
 }
