@@ -4,7 +4,7 @@
 
 // 1. Enums used by the whole system
 enum class Level { DEBUG, INFO, WARNING, ERROR, CRITICAL };
-enum class FileRole { LOG, MEASURE, COUNT };
+enum class FileRole { LOG, MEASURE, PENDING_DATA, COUNT };
 enum class TransMode { PENDING, MQTT, LORA, FAIL };
 
 // 2. SystemLog Struct (ONLY ONCE)
