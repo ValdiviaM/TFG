@@ -29,7 +29,11 @@ public:
   bool begin(SemaphoreHandle_t sharedSpiMutex, size_t queueSize = 50);
 
   bool log(const char *msg, Level level = Level::INFO);
-
+  // Add these to the public section of the Logger class
+  bool logPending(const String &csvLine, time_t ts);
+  bool getNextPending(String &line, size_t &nextOffset);
+  bool advancePending(size_t newOffset);
+  size_t pendingBacklog();
   bool logMeasure(const String &csvLine, time_t ts);
 
   void processInternalLogs();

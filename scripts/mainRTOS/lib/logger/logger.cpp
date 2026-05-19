@@ -14,15 +14,77 @@ bool Logger::begin(SemaphoreHandle_t sharedSpiMutex, size_t queueSize) {
 
   _spiSD.begin(_sck, _miso, _mosi, _ss);
 
-  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(1000))) {
-    bool ok = SD.begin(_ss, _spiSD);
-    xSemaphoreGive(_spiMutex);
-    return ok;
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(1000)) != pdTRUE)
+    return false;
+
+  bool ok = SD.begin(_ss, _spiSD);
+
+  if (ok) {
+
+    // ---------------- SYSTEM LOG ----------------
+    if (!SD.exists("/system.log")) {
+      File f = SD.open("/system.log", FILE_WRITE);
+
+      if (f)
+        f.close();
+    }
+
+    // ---------------- DATA CSV ----------------
+    if (!SD.exists("/data.csv")) {
+      File f = SD.open("/data.csv", FILE_WRITE);
+
+      if (f) {
+        f.println("date,time,flow_Lmin,totalLiters,pressure,depth,"
+                  "proximity_cm,waterLevel,temperature,transport");
+
+        f.close();
+      }
+    }
+
+    // ---------------- PENDING CSV ----------------
+    size_t startOffset = 0;
+
+    if (!SD.exists("/pending.csv")) {
+      File f = SD.open("/pending.csv", FILE_WRITE);
+
+      if (f) {
+        f.println("date,time,flow_Lmin,totalLiters,pressure,depth,"
+                  "proximity_cm,waterLevel,temperature");
+
+        startOffset = f.position();
+
+        f.close();
+      }
+    } else {
+      // If file already exists, start from beginning
+      File f = SD.open("/pending.csv", FILE_READ);
+
+      if (f) {
+        startOffset = 0;
+        f.close();
+      }
+    }
+
+    // ---------------- PENDING INDEX ----------------
+    if (!SD.exists("/pending.idx")) {
+      File f = SD.open("/pending.idx", FILE_WRITE);
+
+      if (f) {
+        char buf[12];
+
+        snprintf(buf, sizeof(buf), "%010lu", (unsigned long)startOffset);
+
+        f.print(buf);
+
+        f.close();
+      }
+    }
   }
 
-  return false;
-}
+  xSemaphoreGive(_spiMutex);
 
+  return ok;
+}
 bool Logger::log(const char *msg, Level level) {
   if (_logQueue == NULL)
     return false;
@@ -50,32 +112,6 @@ bool Logger::logMeasure(const String &csvLine, time_t ts) {
   return writeToSD(csvLine, Level::INFO, FileRole::MEASURE, ts);
 }
 
-bool Logger::writeToSD(const String &message, Level level, FileRole role,
-                       time_t externalTime) {
-
-  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
-    return false;
-
-  String fileName = _filenames[(size_t)role];
-  String ts = formatTimestamp(externalTime);
-
-  String line = (role == FileRole::MEASURE)
-                    ? ts + "," + levelToString(level) + "," + message
-                    : ts + " [" + levelToString(level) + "]: " + message;
-
-  File file = SD.open(fileName, FILE_APPEND);
-
-  if (file) {
-    file.println(line);
-    file.close();
-    xSemaphoreGive(_spiMutex);
-    return true;
-  }
-
-  xSemaphoreGive(_spiMutex);
-  return false;
-}
-
 String Logger::formatTimestamp(time_t rawTime) {
   struct tm timeinfo;
   localtime_r(&rawTime, &timeinfo);
@@ -101,4 +137,153 @@ String Logger::levelToString(Level level) {
   default:
     return "UNKNOWN";
   }
+}
+// 1. Update writeToSD to remove "INFO" from CSV files for cleaner parsing
+
+bool Logger::writeToSD(const String &message, Level level, FileRole role,
+                       time_t externalTime) {
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    return false;
+
+  String fileName = _filenames[(size_t)role];
+  String ts = formatTimestamp(externalTime);
+  String line;
+
+  // Format: YYYY-MM-DD,HH:MM:SS,data1,data2... (Matches your logMeasure logic)
+  if (role == FileRole::MEASURE || role == FileRole::PENDING_DATA) {
+    line = ts + "," + message;
+  } else {
+    line = ts + " [" + levelToString(level) + "]: " + message;
+  }
+
+  File file = SD.open(fileName, FILE_APPEND);
+  if (file) {
+    file.println(line);
+    file.close();
+    xSemaphoreGive(_spiMutex);
+    return true;
+  }
+  xSemaphoreGive(_spiMutex);
+  return false;
+}
+// 2. Add the FIFO logic
+bool Logger::logPending(const String &csvLine, time_t ts) {
+  return writeToSD(csvLine, Level::INFO, FileRole::PENDING_DATA, ts);
+}
+
+bool Logger::getNextPending(String &line, size_t &nextOffset) {
+
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    return false;
+
+  size_t offset = 0;
+
+  // ---------- READ CURRENT OFFSET ----------
+
+  File idxFile = SD.open("/pending.idx", FILE_READ);
+
+  if (idxFile) {
+
+    offset = idxFile.parseInt();
+
+    idxFile.close();
+  }
+
+  // ---------- OPEN FILE ----------
+
+  File dataFile =
+      SD.open(_filenames[(size_t)FileRole::PENDING_DATA], FILE_READ);
+
+  if (!dataFile) {
+
+    xSemaphoreGive(_spiMutex);
+
+    return false;
+  }
+
+  // ---------- EOF ----------
+
+  if (offset >= dataFile.size()) {
+
+    dataFile.close();
+
+    xSemaphoreGive(_spiMutex);
+
+    return false;
+  }
+
+  // ---------- SEEK ----------
+
+  dataFile.seek(offset);
+
+  // ---------- READ NEXT LINE ----------
+
+  line = dataFile.readStringUntil('\n');
+
+  // SAVE NEXT OFFSET
+  nextOffset = dataFile.position();
+
+  dataFile.close();
+
+  line.trim();
+
+  xSemaphoreGive(_spiMutex);
+
+  // Ignore empty lines
+  if (line.isEmpty())
+    return false;
+
+  // Ignore header
+  if (line.startsWith("date,time"))
+    return false;
+
+  return true;
+}
+bool Logger::advancePending(size_t newOffset) {
+
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    return false;
+
+  File idxFile = SD.open("/pending.idx", FILE_WRITE);
+
+  if (!idxFile) {
+
+    xSemaphoreGive(_spiMutex);
+
+    return false;
+  }
+
+  char buf[16];
+
+  snprintf(buf, sizeof(buf), "%010lu", (unsigned long)newOffset);
+
+  idxFile.print(buf);
+
+  idxFile.close();
+
+  xSemaphoreGive(_spiMutex);
+
+  return true;
+}
+size_t Logger::pendingBacklog() {
+  if (xSemaphoreTake(_spiMutex, pdMS_TO_TICKS(500)) != pdTRUE)
+    return 0;
+  File dataFile =
+      SD.open(_filenames[(size_t)FileRole::PENDING_DATA], FILE_READ);
+  if (!dataFile) {
+    xSemaphoreGive(_spiMutex);
+    return 0;
+  }
+  size_t totalSize = dataFile.size();
+  dataFile.close();
+
+  size_t offset = 0;
+  File idxFile = SD.open("/pending.idx", FILE_READ);
+  if (idxFile) {
+    offset = idxFile.parseInt();
+    idxFile.close();
+  }
+  xSemaphoreGive(_spiMutex);
+
+  return (totalSize > offset) ? (totalSize - offset) : 0;
 }
