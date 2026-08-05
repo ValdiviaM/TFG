@@ -208,7 +208,19 @@ void UplinkTask(void *pv) {
 
         miLogger.log(msg, Level::INFO);
 
-        WiFi.begin("Anibal 5G", "");
+        if (WiFi.getMode() != WIFI_STA) {
+          WiFi.mode(WIFI_STA);
+        }
+
+        if (WiFi.status() != WL_CONNECTED) {
+
+          WiFi.disconnect(false, true);
+
+          vTaskDelay(pdMS_TO_TICKS(200));
+
+          WiFi.begin("Android_Anibal", "A10101234");
+          // WiFi.begin("hvaldivia", "kiannymatricula");
+        }
 
         // Exponential backoff
         wifiRetryInterval *= 2;
@@ -261,19 +273,19 @@ void UplinkTask(void *pv) {
 
     // Dynamic throttling based on pending backlog size
 
-    if (backlog < 5000) {
+    if (backlog < 10000) {
 
       // <5KB
       dynamicReportPeriod = 120000; // 2 min
-    } else if (backlog < 10000) {
+    } else if (backlog < 20000) {
 
       // <10 KB
       dynamicReportPeriod = 600000; // 10 min
-    } else if (backlog < 15000) {
+    } else if (backlog < 40000) {
 
       // <15 KB
       dynamicReportPeriod = 1800000; // 30 min
-    } else if (backlog < 20000) {
+    } else if (backlog < 60000) {
 
       // <20 KB
       dynamicReportPeriod = 3600000; // 60 min
