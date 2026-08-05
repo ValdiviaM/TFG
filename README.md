@@ -82,6 +82,7 @@ The contents of this directory should **not be considered the current implementa
 Some scripts may be outdated, incomplete, depend on libraries or configurations that are no longer used, or may not work correctly with the current hardware/software configuration.
 
 However, they can be useful as **examples or references** when investigating how a particular sensor or feature was initially tested.
+
 ---
 
 ## Getting Started
